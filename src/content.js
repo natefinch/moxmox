@@ -106,6 +106,7 @@ function resetRoomState(nextGameType) {
   intentionalDisconnect = true;
   stopHeartbeat();
   clearReconnectTimer();
+  clearSendThrottle();
   if (ws) {
     try { ws.close(); } catch (_) {}
     ws = null;
@@ -1112,10 +1113,48 @@ function scheduleReconnect() {
   }, WS_RECONNECT_MS);
 }
 
+let wsThrottled = false;
+let wsPendingQueue = [];
+let wsThrottleTimer = null;
+
 function sendWs(msg) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  if (wsThrottled) {
+    // Dedup position updates — keep only the latest per syncId.
+    if (msg.type === 'zone-sync' && msg.action === 'update-state' && msg.syncId) {
+      const idx = wsPendingQueue.findIndex(m =>
+        m.type === 'zone-sync' && m.action === 'update-state' && m.syncId === msg.syncId,
+      );
+      if (idx >= 0) { wsPendingQueue[idx] = msg; return; }
+    }
+    if (wsPendingQueue.length < 50) wsPendingQueue.push(msg);
+    return;
+  }
+
   ws.send(JSON.stringify(msg));
   addLog('out', `SEND: ${msg.type}`);
+}
+
+function activateSendThrottle() {
+  if (wsThrottled) return;
+  wsThrottled = true;
+  addLog('in', '⚠️ Rate limited — throttling sends');
+  wsThrottleTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN || wsPendingQueue.length === 0) {
+      clearSendThrottle();
+      return;
+    }
+    const next = wsPendingQueue.shift();
+    ws.send(JSON.stringify(next));
+    addLog('out', `SEND: ${next.type}`);
+  }, 250);
+}
+
+function clearSendThrottle() {
+  wsThrottled = false;
+  wsPendingQueue = [];
+  if (wsThrottleTimer) { clearInterval(wsThrottleTimer); wsThrottleTimer = null; }
 }
 
 function handleServerMessage(data) {
@@ -1229,6 +1268,12 @@ function handleServerMessage(data) {
       updateRemoteHandCount(msg.handCount, msg.senderId, msg.username);
       break;
     case 'pong':
+      break;
+    case 'error':
+      if (msg.code === 'rate_limited') {
+        activateSendThrottle();
+      }
+      addLog('in', `⚠️ ERROR: ${msg.text || msg.code}`);
       break;
     default:
       addLog('in', `RECV: ${msg.type}`);
@@ -2550,6 +2595,7 @@ function leaveCurrentGame() {
   intentionalDisconnect = true;
   stopHeartbeat();
   clearReconnectTimer();
+  clearSendThrottle();
   if (ws) {
     // Send leave message before closing so the server frees the seat.
     try { ws.send(JSON.stringify({ type: 'leave' })); } catch (_) {}

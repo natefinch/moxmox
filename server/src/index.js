@@ -10,6 +10,27 @@ const VALID_GAME_TYPES = new Set([GAME_TYPE_SHARED, GAME_TYPE_TRADITIONAL]);
 const TRADITIONAL_ROOM_RE = /^[A-HJ-NP-Z2-9]{6}$/;
 const MAX_MESSAGE_BYTES = 65536;
 
+// ── Security limits ─────────────────────────────────────────────────
+const MAX_CONNECTIONS_PER_ROOM = 10;
+const RATE_LIMIT_MAX_TOKENS = 5;
+const RATE_LIMIT_REFILL_PER_SEC = 5;
+const MIN_PLAYER_KEY_LENGTH = 16;
+const MAX_USERNAME_LENGTH = 32;
+const ROOM_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+// Allowed relay fields per message type (prevents arbitrary field injection).
+const RELAY_FIELDS = {
+  'zone-sync': new Set(['action', 'zone', 'cardId', 'syncId', 'pctX', 'pctY',
+    'fromZone', 'toZone', 'updates', 'syncIds', 'cards', 'targetId', 'gift']),
+  'life-sync': new Set(['life']),
+  'hand-count-sync': new Set(['handCount']),
+  'game-init': new Set(['library']),
+  'game-ready': new Set(['drawnCount']),
+  'game-start': new Set([]),
+  'drawCard': new Set([]),
+  'discard': new Set([]),
+};
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -63,6 +84,17 @@ function validateMaxPlayers(value) {
 
 function playerIdForIndex(index) {
   return `p${index + 1}`;
+}
+
+/** Build a relay-safe copy of a parsed message, keeping only whitelisted fields. */
+function sanitizeRelayMessage(parsed) {
+  const allowed = RELAY_FIELDS[parsed.type];
+  if (!allowed) return null;
+  const clean = { type: parsed.type };
+  for (const key of allowed) {
+    if (key in parsed) clean[key] = parsed[key];
+  }
+  return clean;
 }
 
 export class Room {
@@ -162,6 +194,7 @@ export class Room {
       createdAt: Date.now(),
     };
     await this.saveMetadata(metadata);
+    await this.touchActivity();
     return json(await this.buildRoomInfo(metadata), 201);
   }
 
@@ -186,6 +219,23 @@ export class Room {
   }
 
   async acceptWebSocket() {
+    // Per-room connection cap.
+    const allSockets = this.state.getWebSockets();
+    if (allSockets.length >= MAX_CONNECTIONS_PER_ROOM) {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.state.acceptWebSocket(server);
+      try {
+        server.send(JSON.stringify({
+          type: 'system',
+          text: 'Room connection limit reached.',
+          rejected: true,
+        }));
+      } catch (_) {}
+      server.close(4005, 'Connection limit');
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
@@ -291,25 +341,59 @@ export class Room {
     const att = ws.deserializeAttachment();
     if (!att?.authenticated) return;
 
+    // Rate limiting (token bucket).
+    if (!this.checkRateLimit(ws, att)) {
+      try {
+        ws.send(JSON.stringify({ type: 'error', code: 'rate_limited', text: 'Too many messages. Please slow down.' }));
+      } catch (_) {}
+      return;
+    }
+
+    // Sanitize: only relay whitelisted fields per message type.
+    const sanitized = sanitizeRelayMessage(parsed);
+    if (!sanitized) return;
+
     const outbound = {
-      ...parsed,
+      ...sanitized,
       senderId: att.playerId,
       username: att.username || 'Anonymous',
     };
 
-    if (parsed.type === 'zone-sync' && parsed.targetId) {
-      this.sendToTarget(ws, parsed.targetId, outbound);
+    if (sanitized.type === 'zone-sync' && sanitized.targetId) {
+      this.sendToTarget(ws, sanitized.targetId, outbound);
       return;
     }
 
     this.broadcastExcept(ws, outbound);
   }
 
+  /** Token bucket rate limiter. Returns true if the message is allowed. */
+  checkRateLimit(ws, att) {
+    const now = Date.now();
+    let tokens = att.rlTokens ?? RATE_LIMIT_MAX_TOKENS;
+    const lastRefill = att.rlLastRefill ?? now;
+
+    const elapsed = (now - lastRefill) / 1000;
+    tokens = Math.min(RATE_LIMIT_MAX_TOKENS, tokens + elapsed * RATE_LIMIT_REFILL_PER_SEC);
+
+    if (tokens < 1) {
+      att.rlTokens = tokens;
+      att.rlLastRefill = now;
+      ws.serializeAttachment(att);
+      return false;
+    }
+
+    att.rlTokens = tokens - 1;
+    att.rlLastRefill = now;
+    ws.serializeAttachment(att);
+    return true;
+  }
+
   async handleJoin(ws, parsed) {
     const playerKey = parsed.playerKey;
 
-    if (!playerKey || typeof playerKey !== 'string') {
-      this.rejectJoin(ws, 'Join rejected: missing playerKey.', 4001, 'Missing playerKey');
+    if (!playerKey || typeof playerKey !== 'string' || playerKey.length < MIN_PLAYER_KEY_LENGTH) {
+      this.rejectJoin(ws, 'Join rejected: invalid playerKey.', 4001, 'Invalid playerKey');
       return;
     }
 
@@ -357,7 +441,7 @@ export class Room {
       return;
     }
 
-    const username = parsed.username || 'Anonymous';
+    const username = (parsed.username || 'Anonymous').slice(0, MAX_USERNAME_LENGTH);
     if (!record) {
       record = {
         playerKey,
@@ -370,6 +454,9 @@ export class Room {
     }
     this.playerRecords = records;
     await this.savePlayerRecords();
+
+    // Reset room TTL on join.
+    await this.touchActivity();
 
     ws.serializeAttachment({
       playerKey,
@@ -532,6 +619,25 @@ export class Room {
     }
 
     ws.close(code, reason);
+  }
+
+  // ── Room TTL ─────────────────────────────────────────────────────────
+
+  async touchActivity() {
+    await this.state.storage.setAlarm(Date.now() + ROOM_TTL_MS);
+  }
+
+  async alarm() {
+    // If anyone is still connected, reschedule.
+    const sockets = this.state.getWebSockets();
+    if (sockets.length > 0) {
+      await this.state.storage.setAlarm(Date.now() + ROOM_TTL_MS);
+      return;
+    }
+    // No connections — clean up the room.
+    await this.state.storage.deleteAll();
+    this.metadata = null;
+    this.playerRecords = null;
   }
 
   async webSocketError(ws, error) {
